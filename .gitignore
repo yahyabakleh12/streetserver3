@@ -1,0 +1,12 @@
+snapshots/
+plates/
+models/
+spot_last/
+video_clips/
+reports_json/
+parking_app.log
+__pycache__/
+cameras.log
+check_similarity/
+AN_VIDEO_OUTPUT_DIR/
+car_crops/

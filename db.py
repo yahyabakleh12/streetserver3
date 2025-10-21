@@ -1,0 +1,38 @@
+# db.py
+
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+
+load_dotenv()
+# ─── Database connection ───
+# `DATABASE_URL` can be supplied by the environment. If missing we fall back to
+# a local SQLite database so that queued data persists between restarts.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./app.db")
+
+# Create engine with sensible defaults.  For SQLite we must also disable the
+# thread check so the background worker can access the database.
+engine_kwargs = dict(
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=30,
+)
+
+if DATABASE_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **engine_kwargs)
+
+Base = declarative_base()
+
+# We set expire_on_commit=False so that after commit our objects do not expire
+SessionLocal = sessionmaker(
+    bind            = engine,
+    autoflush       = False,
+    autocommit      = False,
+    expire_on_commit=False
+)
