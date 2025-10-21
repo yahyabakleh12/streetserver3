@@ -38,6 +38,29 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 All camera triggers are now served from the same application, so only one process is required.
 
+### Docker Compose stack
+
+For local development the repository ships with a `docker-compose.yml` that provisions
+TimescaleDB, MinIO (plus a setup job that bootstraps an object-storage bucket) and the API
+service. Build and start the stack with:
+
+```bash
+docker compose up --build
+```
+
+Default credentials are stored in the compose file and can be overridden with environment
+variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | Database credentials used by TimescaleDB and the API | `street` |
+| `POSTGRES_DB` | Database name created at startup | `streetserver` |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | MinIO access and secret key | `minioadmin` / `minioadminsecret` |
+| `MINIO_BUCKET_NAME` | Bucket created by the helper job | `streetserver` |
+
+Once the containers are running the API is available at http://localhost:8000, TimescaleDB at
+localhost:5432 and MinIO at http://localhost:9000 (with the console at http://localhost:9001).
+
 ### Background processing with Dramatiq
 
 Set `RABBITMQ_URL` to a persistent RabbitMQ instance. The application will
