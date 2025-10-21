@@ -3,9 +3,10 @@
 import os
 import io
 import re
-import json
 import base64
-from datetime import datetime, timedelta
+import binascii
+import json
+from datetime import datetime, timedelta, timezone
 import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ import threading
 import numpy as np
 import time
 from pathlib import Path
+import orjson
 try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -30,11 +32,7 @@ from fastapi import (
     UploadFile,
     File,
 )
-from fastapi.responses import (
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import ORJSONResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import os
@@ -81,11 +79,12 @@ from utils import is_same_car
 from network import ping_all_cameras
 from config import API_LOCATION_ID, OCR_TOKEN
 from image_enhancer import enhance_image_array
+from storage import put_snapshot
 
 from pydantic import BaseModel
 from logic import exit_video_analyses
 
-app = FastAPI()
+app = FastAPI(default_response_class=ORJSONResponse)
 
 
 
@@ -222,6 +221,136 @@ async def echo(request: Request):
             status_code=400, detail="No camera found for that parking_area"
         )
     return row[0]
+
+
+def _parse_event_timestamp(value) -> datetime:
+    """Return a timezone-naive UTC ``datetime`` for the provided value."""
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            return datetime.utcnow()
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate:
+            if candidate.endswith("Z"):
+                candidate = candidate[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+            except ValueError:
+                pass
+            else:
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                return parsed
+
+    return datetime.utcnow()
+
+
+@app.post("/ingest", response_class=ORJSONResponse)
+async def ingest_camera_report(request: Request):
+    """Fast ingest path that stores snapshots in object storage and the database."""
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    try:
+        payload = orjson.loads(body)
+    except orjson.JSONDecodeError as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
+
+    snapshot_b64 = payload.get("snapshot")
+    if not snapshot_b64 or not isinstance(snapshot_b64, str):
+        raise HTTPException(status_code=422, detail="Missing snapshot field")
+
+    snapshot_b64 = snapshot_b64.strip()
+    if snapshot_b64.startswith("data:") and "," in snapshot_b64:
+        snapshot_b64 = snapshot_b64.split(",", 1)[1]
+
+    try:
+        raw_bytes = base64.b64decode(snapshot_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Snapshot must be base64 encoded")
+
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Snapshot image is empty")
+
+    if cv2 is None:  # pragma: no cover - depends on optional dependency
+        raise HTTPException(status_code=503, detail="OpenCV is not available")
+
+    np_array = np.frombuffer(raw_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Snapshot is not a valid image")
+
+    success, encoded = cv2.imencode(".jpg", frame)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to encode snapshot")
+
+    image_bytes = encoded.tobytes()
+    image_key = (
+        f"camera-reports/{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid.uuid4().hex}.jpg"
+    )
+
+    try:
+        put_snapshot(image_key, image_bytes, content_type="image/jpeg")
+    except Exception:  # pragma: no cover - external dependency failure
+        logger.exception("Failed to upload snapshot to object storage")
+        raise HTTPException(status_code=502, detail="Failed to store snapshot")
+
+    event_ts = _parse_event_timestamp(payload.get("time") or payload.get("ts"))
+    camera_identifier = (
+        payload.get("device")
+        or payload.get("camera_id")
+        or payload.get("parking_area")
+    )
+    if not camera_identifier:
+        raise HTTPException(status_code=422, detail="Missing camera identifier")
+
+    occupancy_raw = payload.get("occupancy")
+    try:
+        occupancy_value = int(occupancy_raw) if occupancy_raw is not None else None
+    except (TypeError, ValueError):
+        occupancy_value = None
+
+    event_type = payload.get("event") or payload.get("report_type") or "ingest"
+
+    payload_to_store = dict(payload)
+    payload_to_store.pop("snapshot", None)
+
+    session = SessionLocal()
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO camera_reports (ts, camera_id, event_type, occupancy, image_key, payload)
+                VALUES (:ts, :camera_id, :event_type, :occupancy, :image_key, :payload)
+                """
+            ),
+            {
+                "ts": event_ts,
+                "camera_id": camera_identifier,
+                "event_type": event_type,
+                "occupancy": occupancy_value,
+                "image_key": image_key,
+                "payload": orjson.dumps(payload_to_store).decode("utf-8"),
+            },
+        )
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        logger.exception("Failed to persist camera report")
+        raise HTTPException(status_code=500, detail="Failed to persist camera report")
+    finally:
+        session.close()
+
+    return {"status": "ok", "image_key": image_key}
 
 
 # ── Authentication setup ───────────────────────────────────────────────────

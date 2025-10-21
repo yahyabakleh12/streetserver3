@@ -30,42 +30,60 @@ if DATABASE_URL.startswith("sqlite"):
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 
 
-def _initialize_timescale_hypertables() -> None:
-    """Ensure TimescaleDB extensions and hypertables exist when using Postgres."""
+def _initialize_camera_reports_table() -> None:
+    """Ensure the ``camera_reports`` table exists for the current backend."""
 
-    if engine.url.get_backend_name() != "postgresql":
-        return
+    backend = engine.url.get_backend_name()
 
-    camera_reports_table_sql = """
-    CREATE TABLE IF NOT EXISTS camera_reports (
-      id BIGSERIAL PRIMARY KEY,
-      ts timestamptz NOT NULL,
-      camera_id text NOT NULL,
-      event_type text NOT NULL,
-      occupancy int,
-      bbox jsonb,
-      image_key text,
-      payload jsonb NOT NULL
-    );
-    """
+    if backend == "postgresql":
+        camera_reports_table_sql = """
+        CREATE TABLE IF NOT EXISTS camera_reports (
+          id BIGSERIAL PRIMARY KEY,
+          ts timestamptz NOT NULL,
+          camera_id text NOT NULL,
+          event_type text NOT NULL,
+          occupancy int,
+          bbox jsonb,
+          image_key text,
+          payload jsonb NOT NULL
+        );
+        """
 
-    with engine.begin() as connection:
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb"))
-        connection.execute(text(camera_reports_table_sql))
-        connection.execute(
-            text("SELECT create_hypertable('camera_reports','ts', if_not_exists=>true);")
-        )
-        connection.execute(
-            text(
-                """
-                CREATE INDEX IF NOT EXISTS camera_reports_camera_id_ts_idx
-                ON camera_reports (camera_id, ts DESC);
-                """
+        with engine.begin() as connection:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS timescaledb"))
+            connection.execute(text(camera_reports_table_sql))
+            connection.execute(
+                text(
+                    "SELECT create_hypertable('camera_reports','ts', if_not_exists=>true);"
+                )
             )
-        )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS camera_reports_camera_id_ts_idx
+                    ON camera_reports (camera_id, ts DESC);
+                    """
+                )
+            )
+    else:
+        camera_reports_table_sql = """
+        CREATE TABLE IF NOT EXISTS camera_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TIMESTAMP NOT NULL,
+          camera_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          occupancy INTEGER,
+          bbox TEXT,
+          image_key TEXT,
+          payload TEXT NOT NULL
+        );
+        """
+
+        with engine.begin() as connection:
+            connection.execute(text(camera_reports_table_sql))
 
 
-_initialize_timescale_hypertables()
+_initialize_camera_reports_table()
 
 Base = declarative_base()
 
