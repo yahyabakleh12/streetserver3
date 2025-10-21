@@ -1,4 +1,4 @@
-# StreetServer2
+# StreetServer3
 
 StreetServer2 is a FastAPI application that receives parking reports from network cameras and stores them as JSON files. When a vehicle is detected occupying a spot, a snapshot is processed through a YOLO-based OCR pipeline to read the license plate. Tickets are then created in the database and optionally synchronized with the Parkonic API.
 
