@@ -15,8 +15,8 @@ pip install -r requirements.txt
 The application reads configuration from environment variables. Set the
 following variables before running the server:
 
-- `DATABASE_URL` – MySQL connection string using the PyMySQL driver
-  (`mysql+pymysql`). This variable is required.
+- `DATABASE_URL` – PostgreSQL / TimescaleDB connection string using the
+  Psycopg2 driver (`postgresql+psycopg2`). This variable is required.
 - `OCR_TOKEN` – token for the OCR service. This variable is required.
  - `YOLO_MODEL_PATH` – path to the YOLOv11x vehicle detection model (can also be changed in
    `config.py`).
@@ -31,7 +31,9 @@ Camera credentials and the Parkonic API token are now stored per location in the
 
 ## Running the server
 
-Make sure MySQL is running and the tables defined in `models.py` exist. Then start the API with:
+Make sure TimescaleDB (PostgreSQL) is running and the tables defined in
+`models.py` exist. The service automatically provisions the `camera_reports`
+hypertable (see `sql/camera_reports_hypertable.sql` for the raw SQL). Then start the API with:
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
@@ -60,6 +62,12 @@ variables:
 
 Once the containers are running the API is available at http://localhost:8000, TimescaleDB at
 localhost:5432 and MinIO at http://localhost:9000 (with the console at http://localhost:9001).
+
+### Timescale hypertables
+
+On start-up the API ensures that the `timescaledb` extension is enabled and that the
+`camera_reports` table is a hypertable. The SQL used for this setup is stored in
+`sql/camera_reports_hypertable.sql` and can be applied manually with `psql` if needed.
 
 ### Background processing with Dramatiq
 

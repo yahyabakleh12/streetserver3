@@ -12,7 +12,6 @@ from sqlalchemy import (
     Table,
     Text,
 )
-from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from db import Base
 
@@ -259,7 +258,7 @@ class Ticket(Base):
     entry_time       = Column(DateTime,   nullable=False)
     exit_time        = Column(DateTime,   nullable=True)
     parkonic_trip_id = Column(Integer,    nullable=True)
-    image_base64    = Column(Text().with_variant(LONGTEXT, "mysql"), nullable=True)
+    image_base64    = Column(Text, nullable=True)
     entry_image_path = Column(String(255), nullable=True)
     exit_clip_path   = Column(String(255), nullable=True)
     created_at       = Column(DateTime, default=datetime.utcnow)

@@ -4,7 +4,6 @@ fastapi
 gdown
 httpx
 imutils
-mysql-connector-python
 numpy
 opencv_python
 orjson
