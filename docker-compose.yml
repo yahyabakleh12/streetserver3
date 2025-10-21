@@ -1,0 +1,89 @@
+version: "3.9"
+
+x-minio-credentials: &minio-creds
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadminsecret}
+  MINIO_BUCKET_NAME: ${MINIO_BUCKET_NAME:-streetserver}
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: streetserver-timescaledb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-street}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-street}
+      POSTGRES_DB: ${POSTGRES_DB:-streetserver}
+    command: [
+      "postgres",
+      "-c", "shared_preload_libraries=timescaledb",
+      "-c", "timescaledb.telemetry_level=off"
+    ]
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: streetserver-minio
+    environment:
+      <<: *minio-creds
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: streetserver-minio-setup
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      <<: *minio-creds
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      set -eu
+      until mc alias set local http://minio:9000 "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}"; do
+        sleep 1
+      done
+      mc mb -p local/${MINIO_BUCKET_NAME} || true
+      mc anonymous set download local/${MINIO_BUCKET_NAME}
+    restart: "no"
+
+  api:
+    build:
+      context: .
+    container_name: streetserver-api
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-street}:${POSTGRES_PASSWORD:-street}@timescaledb:5432/${POSTGRES_DB:-streetserver}
+      OCR_TOKEN: ${OCR_TOKEN:-dev-token}
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_BUCKET_NAME: ${MINIO_BUCKET_NAME:-streetserver}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadminsecret}
+    volumes:
+      - ./:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+
+volumes:
+  timescale-data:
+  minio-data:
