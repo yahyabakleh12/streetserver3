@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 TEST_DB = "sqlite:///./test.db"
 os.environ["DATABASE_URL"] = TEST_DB
+os.environ["POST_QUEUE_INLINE"] = "1"
 
 # Provide a lightweight stub for the optional ultralytics dependency so that
 # importing ``ocr_processor`` inside ``main`` doesn't require the real package

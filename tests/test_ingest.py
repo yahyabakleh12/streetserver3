@@ -29,8 +29,10 @@ def client(tmp_path, monkeypatch):
     original_db_module = sys.modules.pop("db", None)
     original_main_module = sys.modules.pop("main", None)
     original_database_url = os.environ.get("DATABASE_URL")
+    original_post_queue_inline = os.environ.get("POST_QUEUE_INLINE")
 
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path / 'ingest.db'}"
+    os.environ["POST_QUEUE_INLINE"] = "1"
     db_module = importlib.import_module("db")
     main_module = importlib.import_module("main")
 
@@ -90,6 +92,10 @@ def client(tmp_path, monkeypatch):
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = original_database_url
+        if original_post_queue_inline is None:
+            os.environ.pop("POST_QUEUE_INLINE", None)
+        else:
+            os.environ["POST_QUEUE_INLINE"] = original_post_queue_inline
         if original_db_module is not None:
             sys.modules["db"] = original_db_module
         if original_main_module is not None:

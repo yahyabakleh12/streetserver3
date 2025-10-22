@@ -12,6 +12,7 @@ TEST_DB = "sqlite:///./test.db"
 os.environ["DATABASE_URL"] = TEST_DB
 os.environ["DRAMATIQ_ALWAYS_EAGER"] = "true"
 os.environ["DISABLE_TICKET_RETRY_WORKER"] = "true"
+os.environ["POST_QUEUE_INLINE"] = "1"
 
 
 class DummyYOLO:

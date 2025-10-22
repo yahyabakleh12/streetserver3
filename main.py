@@ -6,14 +6,17 @@ import re
 import base64
 import binascii
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import queue
 import numpy as np
 import time
 from pathlib import Path
+from typing import Any
 import orjson
 try:
     import cv2  # type: ignore
@@ -95,6 +98,77 @@ EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("MAX_WORKERS", "32"
 # Shared HTTP session for outgoing requests
 http_session = requests.Session()
 
+
+@dataclass(slots=True)
+class _PostTask:
+    payload: dict[str, Any]
+    raw_body: bytes
+    ts: str
+
+
+_POST_TASK_QUEUE: "queue.Queue[_PostTask | object]" = queue.Queue()
+_POST_QUEUE_SENTINEL = object()
+_post_worker_stop_event = threading.Event()
+_post_worker_thread: threading.Thread | None = None
+
+
+def _should_process_post_inline() -> bool:
+    flag = os.environ.get("POST_QUEUE_INLINE", "")
+    return flag.lower() in {"1", "true", "yes"}
+
+
+def _enqueue_post_task(payload: dict[str, Any], raw_body: bytes, ts: str) -> None:
+    if _should_process_post_inline():
+        _process_post_task(payload, raw_body, ts)
+        return
+    _POST_TASK_QUEUE.put(_PostTask(payload=payload, raw_body=raw_body, ts=ts))
+
+
+def _post_worker_loop() -> None:
+    while True:
+        try:
+            task = _POST_TASK_QUEUE.get(timeout=1)
+        except queue.Empty:
+            if _post_worker_stop_event.is_set():
+                break
+            continue
+        if task is _POST_QUEUE_SENTINEL:
+            _POST_TASK_QUEUE.task_done()
+            break
+        assert isinstance(task, _PostTask)
+        try:
+            _process_post_task(task.payload, task.raw_body, task.ts)
+        except Exception:
+            logger.error("Background post task failed", exc_info=True)
+        finally:
+            _POST_TASK_QUEUE.task_done()
+
+
+def _start_post_worker() -> None:
+    global _post_worker_thread
+    if _should_process_post_inline():
+        return
+    if _post_worker_thread and _post_worker_thread.is_alive():
+        return
+    _post_worker_stop_event.clear()
+    _post_worker_thread = threading.Thread(
+        target=_post_worker_loop,
+        name="post-worker",
+        daemon=True,
+    )
+    _post_worker_thread.start()
+
+
+def _stop_post_worker() -> None:
+    global _post_worker_thread
+    if _should_process_post_inline():
+        return
+    _post_worker_stop_event.set()
+    if _post_worker_thread and _post_worker_thread.is_alive():
+        _POST_TASK_QUEUE.put(_POST_QUEUE_SENTINEL)
+        _post_worker_thread.join(timeout=5)
+    _post_worker_thread = None
+
 TICKET_RETRY_INTERVAL = int(os.environ.get("TICKET_RETRY_INTERVAL", "60"))
 TICKET_RETRY_BATCH_SIZE = int(os.environ.get("TICKET_RETRY_BATCH_SIZE", "20"))
 _ticket_retry_stop_event = threading.Event()
@@ -146,12 +220,14 @@ os.makedirs(IGNORED_EXIT_DIR, exist_ok=True)
 @app.on_event("startup")
 def _startup() -> None:
     Base.metadata.create_all(bind=engine)
+    _start_post_worker()
     if os.environ.get("DISABLE_TICKET_RETRY_WORKER", "").lower() not in {"1", "true", "yes"}:
         _start_ticket_retry_worker()
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    _stop_post_worker()
     _stop_ticket_retry_worker()
     http_session.close()
     network_session.close()
@@ -249,25 +325,33 @@ def _parse_event_timestamp(value) -> datetime:
     return datetime.utcnow()
 
 
-@app.post("/ingest", response_class=ORJSONResponse)
-async def ingest_camera_report(request: Request):
-    """Fast ingest path that stores snapshots in object storage and the database."""
+def _extract_bbox(payload: dict[str, Any]) -> list[list[int]] | None:
+    point_fields = [
+        ("coordinate_x1", "coordinate_y1"),
+        ("coordinate_x2", "coordinate_y2"),
+        ("coordinate_x3", "coordinate_y3"),
+        ("coordinate_x4", "coordinate_y4"),
+    ]
+    points: list[list[int]] = []
+    for x_key, y_key in point_fields:
+        x_val = payload.get(x_key)
+        y_val = payload.get(y_key)
+        if x_val is None or y_val is None:
+            return None
+        try:
+            points.append([int(x_val), int(y_val)])
+        except (TypeError, ValueError):
+            return None
+    return points
 
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Empty request body")
 
-    try:
-        payload = orjson.loads(body)
-    except orjson.JSONDecodeError as exc:  # pragma: no cover - defensive
-        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
-
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="JSON payload must be an object")
-
+def _store_snapshot_from_payload(payload: dict[str, Any], *, require_snapshot: bool) -> str | None:
     snapshot_b64 = payload.get("snapshot")
-    if not snapshot_b64 or not isinstance(snapshot_b64, str):
-        raise HTTPException(status_code=422, detail="Missing snapshot field")
+    if not isinstance(snapshot_b64, str) or not snapshot_b64.strip():
+        if require_snapshot:
+            raise HTTPException(status_code=422, detail="Missing snapshot field")
+        logger.warning("Received payload without snapshot; skipping image persistence")
+        return None
 
     snapshot_b64 = snapshot_b64.strip()
     if snapshot_b64.startswith("data:") and "," in snapshot_b64:
@@ -276,24 +360,36 @@ async def ingest_camera_report(request: Request):
     try:
         raw_bytes = base64.b64decode(snapshot_b64, validate=True)
     except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="Snapshot must be base64 encoded")
+        if require_snapshot:
+            raise HTTPException(status_code=400, detail="Snapshot must be base64 encoded")
+        logger.warning("Invalid base64 snapshot received; skipping image persistence")
+        return None
 
     if not raw_bytes:
-        raise HTTPException(status_code=400, detail="Snapshot image is empty")
+        if require_snapshot:
+            raise HTTPException(status_code=400, detail="Snapshot image is empty")
+        logger.warning("Empty snapshot received; skipping image persistence")
+        return None
 
-    if cv2 is None:  # pragma: no cover - depends on optional dependency
-        raise HTTPException(status_code=503, detail="OpenCV is not available")
+    image_bytes = raw_bytes
+    if cv2 is not None:  # pragma: no branch - optional dependency
+        np_array = np.frombuffer(raw_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+        if frame is None:
+            if require_snapshot:
+                raise HTTPException(status_code=400, detail="Snapshot is not a valid image")
+            logger.warning("Snapshot could not be decoded; storing raw bytes")
+        else:
+            success, encoded = cv2.imencode(".jpg", frame)
+            if not success:
+                if require_snapshot:
+                    raise HTTPException(status_code=500, detail="Failed to encode snapshot")
+                logger.warning("Failed to encode snapshot; storing raw bytes")
+            else:
+                image_bytes = encoded.tobytes()
+    elif require_snapshot:
+        logger.warning("OpenCV unavailable; storing raw snapshot bytes without re-encoding")
 
-    np_array = np.frombuffer(raw_bytes, dtype=np.uint8)
-    frame = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-    if frame is None:
-        raise HTTPException(status_code=400, detail="Snapshot is not a valid image")
-
-    success, encoded = cv2.imencode(".jpg", frame)
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to encode snapshot")
-
-    image_bytes = encoded.tobytes()
     image_key = (
         f"camera-reports/{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid.uuid4().hex}.jpg"
     )
@@ -302,7 +398,15 @@ async def ingest_camera_report(request: Request):
         put_snapshot(image_key, image_bytes, content_type="image/jpeg")
     except Exception:  # pragma: no cover - external dependency failure
         logger.exception("Failed to upload snapshot to object storage")
-        raise HTTPException(status_code=502, detail="Failed to store snapshot")
+        if require_snapshot:
+            raise HTTPException(status_code=502, detail="Failed to store snapshot")
+        return None
+
+    return image_key
+
+
+def _persist_camera_report(payload: dict[str, Any], *, require_snapshot: bool = True) -> str | None:
+    image_key = _store_snapshot_from_payload(payload, require_snapshot=require_snapshot)
 
     event_ts = _parse_event_timestamp(payload.get("time") or payload.get("ts"))
     camera_identifier = (
@@ -320,6 +424,7 @@ async def ingest_camera_report(request: Request):
         occupancy_value = None
 
     event_type = payload.get("event") or payload.get("report_type") or "ingest"
+    bbox = _extract_bbox(payload)
 
     payload_to_store = dict(payload)
     payload_to_store.pop("snapshot", None)
@@ -329,8 +434,8 @@ async def ingest_camera_report(request: Request):
         session.execute(
             text(
                 """
-                INSERT INTO camera_reports (ts, camera_id, event_type, occupancy, image_key, payload)
-                VALUES (:ts, :camera_id, :event_type, :occupancy, :image_key, :payload)
+                INSERT INTO camera_reports (ts, camera_id, event_type, occupancy, bbox, image_key, payload)
+                VALUES (:ts, :camera_id, :event_type, :occupancy, :bbox, :image_key, :payload)
                 """
             ),
             {
@@ -338,6 +443,9 @@ async def ingest_camera_report(request: Request):
                 "camera_id": camera_identifier,
                 "event_type": event_type,
                 "occupancy": occupancy_value,
+                "bbox": (
+                    orjson.dumps(bbox).decode("utf-8") if bbox is not None else None
+                ),
                 "image_key": image_key,
                 "payload": orjson.dumps(payload_to_store).decode("utf-8"),
             },
@@ -350,6 +458,27 @@ async def ingest_camera_report(request: Request):
     finally:
         session.close()
 
+    return image_key
+
+
+@app.post("/ingest", response_class=ORJSONResponse)
+async def ingest_camera_report(request: Request):
+    """Fast ingest path that stores snapshots in object storage and the database."""
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+
+    try:
+        payload = orjson.loads(body)
+    except orjson.JSONDecodeError as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON payload must be an object")
+
+    image_key = _persist_camera_report(payload, require_snapshot=True)
+
     return {"status": "ok", "image_key": image_key}
 
 
@@ -359,7 +488,16 @@ ALGORITHM = "HS256"
 # Extend token validity to 24 hours so users stay logged in longer
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+try:
+    _bcrypt_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    _bcrypt_context.hash("probe")
+except Exception:
+    logger.warning(
+        "bcrypt backend unavailable; falling back to pbkdf2_sha256 for password hashing"
+    )
+    pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+else:
+    pwd_context = _bcrypt_context
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 _ping_all_cameras_thread = threading.Thread(target=ping_all_cameras, daemon=True)
 _ping_all_cameras_thread.start()
@@ -1763,8 +1901,17 @@ async def receive_parking_data(request: Request):
     except Exception:
         logger.error("Failed to write raw request to disk", exc_info=True)
 
-    camera_id = _get_camera_id_from_payload(payload)
-    await run_in_executor(_process_post_task, payload, b"", ts)
+    _get_camera_id_from_payload(payload)
+    try:
+        _persist_camera_report(payload, require_snapshot=True)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Failed to persist camera report for /post", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to persist camera report")
+
+    _enqueue_post_task(payload, b"", ts)
+
     return JSONResponse(
         status_code=200, content={"message": "Entry processed"}
     )

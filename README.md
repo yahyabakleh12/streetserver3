@@ -23,8 +23,9 @@ following variables before running the server:
 - `REAL_ESRGAN_MODEL_PATH` – path to the RealESRGAN weights used for plate image enhancement.
 - `CORS_ORIGINS`  – comma-separated list of origins allowed to access the API.
   Use `*` to allow requests from any host.
-- `RABBITMQ_URL` – URL for the RabbitMQ message broker used by Dramatiq.
-  This variable is required for background processing.
+- `POST_QUEUE_INLINE` – optional flag (`1`/`true`) that forces the API to
+  process `/post` events inline instead of using the background worker. This
+  is primarily useful for unit tests and local debugging.
 
 Camera credentials and the Parkonic API token are now stored per location in the
 `locations` table instead of being global environment variables.
@@ -69,31 +70,18 @@ On start-up the API ensures that the `timescaledb` extension is enabled and that
 `camera_reports` table is a hypertable. The SQL used for this setup is stored in
 `sql/camera_reports_hypertable.sql` and can be applied manually with `psql` if needed.
 
-### Background processing with Dramatiq
+### Background processing pipeline
 
-Set `RABBITMQ_URL` to a persistent RabbitMQ instance. The application will
-refuse to start if this variable is missing.
+Incoming `/post` events now follow a two-step pipeline:
 
-Incoming `/post` events are queued in Dramatiq. Camera events are distributed
-across fixed shards so that tasks for a given camera are processed in order.
+1. The API validates the payload, stores the snapshot in object storage and
+   writes a compact row to the `camera_reports` hypertable.
+2. A lightweight in-process worker thread dequeues pending events and performs
+   the slower OCR, plate-cropping and ticket-synchronisation tasks.
 
-Start a worker for every queue shard defined in `tasks.py`. The helper script
-`start_workers.py` launches workers for all configured shards:
-
-```bash
-./start_workers.py
-```
-
-To start a single worker manually for shard 0:
-
-```bash
-dramatiq tasks -Q post-shard-0,plate-shard-0 --processes 1
-```
-
-Repeat for each shard index if launching workers manually. Entry and exit events
-for the same camera must target the same shard to preserve ordering. Clip
-requests are processed inline using a thread pool rather than FastAPI's
-`BackgroundTasks`.
+This keeps request latency low without requiring RabbitMQ or Dramatiq. The
+worker starts automatically with the API. For troubleshooting you can set
+`POST_QUEUE_INLINE=1` to execute the slow path synchronously.
 
 The API exposes a `/post` endpoint that accepts JSON payloads describing parking events. This endpoint is intended for camera devices and does **not** require authentication.
 When a device reports an exit (`occupancy` set to `0`), the application now grabs the latest frame from the camera and checks the spot using the plate detector. If a plate is still visible the ticket remains open and the endpoint responds that the spot is still occupied.
